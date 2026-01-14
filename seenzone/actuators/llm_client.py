@@ -34,7 +34,7 @@ except ImportError:
 @dataclass
 class LLMConfig:
     """Configuration for the LLM client."""
-    model: str = "gptoss20b"  # User preference for emotional therapy
+    model: str = "llama-3.3-70b-versatile"  # High-quality model for emotional therapy
     max_tokens: int = 150          # Keep responses brief
     temperature: float = 0.7       # Some creativity
     timeout: float = 10.0          # Request timeout

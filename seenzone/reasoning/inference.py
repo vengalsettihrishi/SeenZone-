@@ -123,8 +123,23 @@ class InferenceEngine:
         Returns:
             Target emotional state, or None if no transition
         """
+        # Log current KB facts for visibility
+        if self.kb.facts:
+            print(f"[KB] Facts: {sorted(self.kb.facts)}")
+        
         # Get all matching rules (sorted by priority)
         matching = self.rule_engine.evaluate(self.kb)
+        
+        # Log all rule evaluations for visibility
+        for rule in self.rule_engine.rules:
+            is_match = rule in matching
+            if is_match:
+                print(f"[RULE] {rule.name}: \033[32mMATCH\033[0m → {rule.target_state.name}")
+            else:
+                # Show which conditions failed
+                failed = [str(c) for c in rule.conditions if not self.kb.holds(c)]
+                if failed:
+                    print(f"[RULE] {rule.name}: \033[90mFAIL\033[0m (missing: {', '.join(failed)})")
         
         # No matching rules
         if not matching:
@@ -154,6 +169,7 @@ class InferenceEngine:
                     explanation=f"Rule '{best_rule.name}' matched but already in {current.name}"
                 )
                 self._history.append(self._last_result)
+                print(f"[INFERENCE] No transition - already in {current.name}")
                 return None
             
             # Check if transition is valid in state space
@@ -166,6 +182,7 @@ class InferenceEngine:
                     explanation=f"Rule '{best_rule.name}' matched but transition to {target_state.name} not valid from {current.name}"
                 )
                 self._history.append(self._last_result)
+                print(f"[INFERENCE] Transition blocked - {target_state.name} not reachable from {current.name}")
                 return None
         
         # Inference successful
@@ -176,6 +193,8 @@ class InferenceEngine:
             explanation=f"Rule '{best_rule.name}' fired: {' ∧ '.join(str(c) for c in best_rule.conditions)} → {target_state.name}"
         )
         self._history.append(self._last_result)
+        
+        print(f"[INFERENCE] \033[32mFIRING\033[0m {best_rule.name} → {target_state.name}")
         
         return target_state
     

@@ -267,15 +267,34 @@ def run_unified_demo(agent, webcam, max_cycles: int = 0):
         webcam: WebcamSensor instance
         max_cycles: Maximum cycles (0 = unlimited)
     """
+    import time
+    from .debug_logger import (
+        log_timing, log_cues, log_state_change, log_response, 
+        log_skip, log_cycle_summary, Timer
+    )
+    
     gui = SeenZoneGUI()
     
     print("\n[Demo] Starting unified visualization")
-    print("[Demo] Press 'q' to quit\n")
+    print("[Demo] Press 'q' to quit")
+    print("[Demo] Debug logging ENABLED\n")
     
     cycle = 0
     
+    # Response rate limiting
+    RESPONSE_COOLDOWN = 5.0  # seconds
+    last_response_time = 0
+    last_state = None
+    last_response = "I'm here with you."
+    
+    # FPS tracking
+    fps_start = time.perf_counter()
+    fps_frame_count = 0
+    current_fps = 0.0
+    
     try:
         while True:
+            cycle_start = time.perf_counter()
             cycle += 1
             
             # Get frame
@@ -284,43 +303,62 @@ def run_unified_demo(agent, webcam, max_cycles: int = 0):
                 print("[Demo] Failed to read frame")
                 break
             
-            # Process with CV if available
+            # ========== CV PROCESSING ==========
             cues = []
+            raw_cues = None
             if agent.cv_processor and agent.cue_interpreter:
-                raw_cues = agent.cv_processor.process(frame)
-                predicates = agent.cue_interpreter.interpret(raw_cues)
-                cues = predicates.to_fol_predicates()
+                with Timer("CV", auto_log=True) as cv_timer:
+                    raw_cues = agent.cv_processor.process(frame)
+                    predicates = agent.cue_interpreter.interpret(raw_cues)
+                    cues = predicates.to_fol_predicates()
                 
-                # Draw face mesh on frame
-                frame = agent.cv_processor.draw_landmarks(frame)
+                log_cues(cues)
+                
+                # Draw face mesh on frame USING CACHED raw_cues (no re-processing!)
+                # Pass raw_cues to avoid calling process() again inside draw_landmarks
+                frame = agent.cv_processor.draw_landmarks(frame, raw_cues)
             
-            # Run reasoning
+            # ========== INFERENCE ==========
+            rule_fired = None
+            new_state = None
             if agent.inference_engine and cues:
-                agent.inference_engine.update_facts(cues)
-                new_state = agent.inference_engine.infer()
+                with Timer("Inference", auto_log=True):
+                    agent.inference_engine.update_facts(cues)
+                    new_state = agent.inference_engine.infer()
                 
                 # Get fired rule name
-                rule_fired = None
                 if agent.inference_engine._last_result and agent.inference_engine._last_result.fired_rule:
                     rule = agent.inference_engine._last_result.fired_rule
                     rule_fired = f"{rule.name} (priority={rule.priority})"
                 
                 # Execute state transition
                 if new_state:
+                    old_state = agent.state_space.current_state
                     agent.state_space.transition_to(new_state)
-            else:
-                rule_fired = None
+                    log_state_change(old_state, new_state, rule_fired)
             
             # Get current state
             current_state = agent.state_space.current_state
             
-            # Generate response
-            if agent.llm_responder:
-                response = agent.llm_responder.generate_response(current_state, cues)
-            else:
-                response = "I'm here with you."
+            # ========== RESPONSE GENERATION (with cooldown) ==========
+            now = time.time()
+            state_changed = current_state != last_state
+            cooldown_expired = (now - last_response_time) > RESPONSE_COOLDOWN
             
-            # Render GUI
+            if agent.llm_responder and (state_changed or cooldown_expired):
+                with Timer("LLM", auto_log=True):
+                    response = agent.llm_responder.generate_response(current_state, cues)
+                last_response = response
+                last_response_time = now
+                last_state = current_state
+                source = "LLM" if agent.llm_responder.is_llm_available() else "fallback"
+                log_response(response, source)
+            else:
+                response = last_response
+                if cycle % 30 == 0:  # Log skip every 30 frames to reduce noise
+                    log_skip("Response cached (cooldown active)")
+            
+            # ========== RENDER GUI ==========
             rendered = gui.render(
                 frame=frame,
                 state=current_state,
@@ -329,6 +367,20 @@ def run_unified_demo(agent, webcam, max_cycles: int = 0):
                 response=response,
                 cycle=cycle
             )
+            
+            # ========== FPS CALCULATION ==========
+            fps_frame_count += 1
+            fps_elapsed = time.perf_counter() - fps_start
+            if fps_elapsed >= 1.0:
+                current_fps = fps_frame_count / fps_elapsed
+                fps_frame_count = 0
+                fps_start = time.perf_counter()
+                log_cycle_summary(cycle, current_fps, current_state, len(cues))
+            
+            # ========== CYCLE TIMING ==========
+            cycle_time = (time.perf_counter() - cycle_start) * 1000
+            if cycle % 30 == 0:  # Log every 30 cycles to reduce noise
+                log_timing("Cycle", cycle_time, f"(~{1000/cycle_time:.1f} FPS)")
             
             # Show and check for quit
             if not gui.show(rendered):

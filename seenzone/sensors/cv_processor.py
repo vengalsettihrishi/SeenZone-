@@ -201,17 +201,30 @@ class CVProcessor:
         Returns:
             AffectiveCues containing all extracted measurements
         """
+        import time
+        
         cues = AffectiveCues()
         
         if not self.enabled or frame is None:
             return cues
         
         # Convert BGR to RGB for MediaPipe
+        convert_start = time.perf_counter()
         rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         rgb_frame.flags.writeable = False  # Performance optimization
+        convert_time = (time.perf_counter() - convert_start) * 1000
         
-        # Process with Face Mesh
+        # Process with Face Mesh (this is the bottleneck)
+        mp_start = time.perf_counter()
         results = self.face_mesh.process(rgb_frame)
+        mp_time = (time.perf_counter() - mp_start) * 1000
+        
+        # Log MediaPipe timing periodically (every ~30 frames to reduce noise)
+        if not hasattr(self, '_frame_count'):
+            self._frame_count = 0
+        self._frame_count += 1
+        if self._frame_count % 30 == 0:
+            print(f"[TIMING] MediaPipe: {mp_time:.1f}ms (convert: {convert_time:.1f}ms)")
         
         if not results.multi_face_landmarks:
             return cues  # No face detected
