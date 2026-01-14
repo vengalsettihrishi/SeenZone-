@@ -180,10 +180,23 @@ class CueInterpreter:
         predicates = SymbolicPredicates()
         t = self.thresholds  # Shorthand
         
+        # === DEBUG: Log raw cue values ===
+        if not hasattr(self, '_log_counter'):
+            self._log_counter = 0
+        self._log_counter += 1
+        
+        # Log every 30 frames to reduce noise
+        if self._log_counter % 30 == 0:
+            print(f"[CV-RAW] face={cues.face_detected} conf={cues.face_confidence:.2f} "
+                  f"pitch={cues.head_pitch:+.2f} yaw={cues.head_yaw:+.2f} "
+                  f"EAR={cues.avg_eye_aspect_ratio:.2f} gaze={cues.gaze_ratio:.2f}")
+        
         # === PRESENCE ===
         predicates.is_present = cues.face_detected
         
         if not cues.face_detected:
+            if self._log_counter % 30 == 0:
+                print(f"[CV-RAW] No face detected - check webcam and lighting")
             predicates.engagement_level = "none"
             return predicates
         
