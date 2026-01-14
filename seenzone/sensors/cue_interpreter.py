@@ -131,6 +131,10 @@ class SymbolicPredicates:
     # NEW: Sadness evidence tracking (for multi-signal detection)
     sadness_evidence_count: int = 0     # How many sadness indicators are present
     
+    # NEW: Positive Valence (emotional valence, NOT engagement)
+    # This represents ACTUAL positive affect, not just activity/attention
+    positive_valence: bool = False      # Smiling OR (CheekRaised AND ExpressiveFace)
+    
     def to_dict(self) -> Dict[str, bool]:
         """Convert to dictionary for rule engine input."""
         return {
@@ -155,6 +159,8 @@ class SymbolicPredicates:
             "is_active": self.is_active,
             "gaze_stable": self.gaze_stable,
             "low_motion_energy": self.low_motion_energy,
+            # Valence predicate
+            "positive_valence": self.positive_valence,
         }
     
     def to_fol_predicates(self) -> list:
@@ -186,6 +192,8 @@ class SymbolicPredicates:
             "is_active": "Active(user)",
             "gaze_stable": "GazeStable(user)",
             "low_motion_energy": "LowMotionEnergy(user)",
+            # Valence predicate
+            "positive_valence": "PositiveValence(user)",
         }
         
         for attr, fol in mapping.items():
@@ -334,23 +342,93 @@ class CueInterpreter:
                   f"blink_rate={cues.blink_rate:.2f} "
                   f"motion_energy={cues.motion_energy:.2f}")
         
-        # === COMPOSITE SIGNALS ===
-        # Engagement: face present + looking at camera + eyes open
-        predicates.is_engaged = (
-            predicates.is_present and 
-            not predicates.is_looking_away and 
-            gaze_centered and
-            not predicates.eyes_closed
+        # =================================================================
+        # DERIVED PREDICATES (Engagement & Attentiveness)
+        # These are the KEY predicates that rules use for positive states
+        # =================================================================
+        
+        # Attentive: GazeStable AND NOT LookingAway
+        # This is a PURE attention signal, NOT dependent on posture or fatigue
+        predicates.is_attentive = (
+            predicates.gaze_stable and 
+            not predicates.is_looking_away
         )
         
-        # Attentive: engaged + alert eyes
-        predicates.is_attentive = predicates.is_engaged and not predicates.is_fatigued
+        # Engaged: Present + GazeStable + (Active OR ExpressiveFace)
+        # This captures positive engagement WITHOUT requiring specific posture
+        predicates.is_engaged = (
+            predicates.is_present and 
+            predicates.gaze_stable and
+            (predicates.is_active or predicates.expressive_face or predicates.is_smiling)
+        )
         
-        # Distracted: looking away or gaze off
-        predicates.is_distracted = predicates.is_looking_away or not gaze_centered
+        # Distracted: looking away or unstable gaze
+        predicates.is_distracted = (
+            predicates.is_looking_away or 
+            not predicates.gaze_stable
+        )
         
         # Tension: furrowed brow + tense mouth
         predicates.shows_tension = brow_furrowed and mouth_tense
+        
+        # =================================================================
+        # POSITIVE VALENCE (Emotional Valence ≠ Engagement)
+        # This is the KEY distinction: valence requires ACTUAL positive affect
+        # =================================================================
+        
+        # PositiveValence requires STRONG EVIDENCE of positive affect:
+        # - Smiling alone is sufficient
+        # - OR CheekRaised (Duchenne marker) + ExpressiveFace together
+        # Explicitly EXCLUDES: Active alone, ExpressiveFace alone, Engaged alone
+        predicates.positive_valence = (
+            predicates.is_smiling or
+            (predicates.cheek_raised and predicates.expressive_face)
+        )
+        
+        # === LOGGING: VALENCE (CRITICAL) ===
+        if should_log:
+            valence_reason = []
+            if predicates.is_smiling:
+                valence_reason.append("Smiling")
+            if predicates.cheek_raised:
+                valence_reason.append("CheekRaised")
+            if predicates.expressive_face:
+                valence_reason.append("ExpressiveFace")
+            
+            if predicates.positive_valence:
+                print(f"[DERIVED] PositiveValence=True ({' ∧ '.join(valence_reason)})")
+            else:
+                print(f"[DERIVED] PositiveValence=False (missing smile or cheek+expression)")
+        
+        # === LOGGING: DERIVED PREDICATES (MANDATORY) ===
+        if should_log:
+            # Engaged reasoning
+            engaged_reason = []
+            if predicates.is_present:
+                engaged_reason.append("Present")
+            if predicates.gaze_stable:
+                engaged_reason.append("GazeStable")
+            if predicates.is_active:
+                engaged_reason.append("Active")
+            if predicates.expressive_face:
+                engaged_reason.append("ExpressiveFace")
+            if predicates.is_smiling:
+                engaged_reason.append("Smiling")
+            
+            print(f"[DERIVED] Engaged={predicates.is_engaged} "
+                  f"({' ∧ '.join(engaged_reason) if engaged_reason else 'no signals'})")
+            
+            # Attentive reasoning
+            attentive_parts = []
+            if predicates.gaze_stable:
+                attentive_parts.append("GazeStable")
+            if not predicates.is_looking_away:
+                attentive_parts.append("NOT LookingAway")
+            else:
+                attentive_parts.append("LookingAway=True")
+            
+            print(f"[DERIVED] Attentive={predicates.is_attentive} "
+                  f"({' ∧ '.join(attentive_parts)})")
         
         # === NEW: SADNESS EVIDENCE COUNTING (MULTI-SIGNAL) ===
         sadness_signals = 0
@@ -382,10 +460,14 @@ class CueInterpreter:
                 cues_list.append("LowMotionEnergy")
             if predicates.gaze_stable:
                 cues_list.append("GazeStable")
+            if predicates.is_engaged:
+                cues_list.append("Engaged")
+            if predicates.is_attentive:
+                cues_list.append("Attentive")
             print(f"[CUES] {', '.join(cues_list) if cues_list else 'None'}")
         
         # === ENGAGEMENT LEVEL ===
-        if predicates.is_attentive:
+        if predicates.is_engaged and predicates.is_attentive:
             predicates.engagement_level = "high"
         elif predicates.is_engaged:
             predicates.engagement_level = "medium"

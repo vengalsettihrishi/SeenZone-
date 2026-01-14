@@ -65,12 +65,22 @@ class InferenceEngine:
     3. Select highest-priority matching rule
     4. Request state transition (if valid)
     5. Record explanation trace
+    6. THROTTLE transitions to prevent rapid oscillation
     
     Academic Mapping:
     - Inference: KB + Rules → Conclusion
     - Forward Chaining: Start with facts, derive new states
     - Explanation: Audit trail of rule firings
     """
+    
+    # Minimum time in state before allowing transition
+    MIN_STATE_DURATION = 2.0  # seconds
+    
+    # Priority threshold to bypass throttle (emergency/override rules)
+    PRIORITY_BYPASS_THRESHOLD = 7
+    
+    # Time without valence before positive state can decay
+    VALENCE_DECAY_DURATION = 3.0  # seconds
     
     def __init__(self, state_space: Optional[StateSpace] = None, 
                  load_default_rules: bool = True):
@@ -89,11 +99,19 @@ class InferenceEngine:
         self._history: List[InferenceResult] = []
         self._last_result: Optional[InferenceResult] = None
         
+        # State transition throttling
+        self._state_entry_time: Optional[float] = None
+        self._current_tracked_state: Optional[EmotionalState] = None
+        
+        # Valence decay tracking (for positive state maintenance)
+        self._last_valence_time: Optional[float] = None
+        
         # Load default rules if requested
         if load_default_rules:
             self.rule_engine.add_rules(create_default_rules())
         
         print(f"[InferenceEngine] Initialized with {len(self.rule_engine)} rules")
+        print(f"[InferenceEngine] Throttle: {self.MIN_STATE_DURATION}s, valence decay: {self.VALENCE_DECAY_DURATION}s")
     
     def set_state_space(self, state_space: StateSpace) -> None:
         """Set the state space reference."""
@@ -110,6 +128,19 @@ class InferenceEngine:
         """
         self.kb.update_from_predicates(fol_predicates)
     
+    def _get_time_in_state(self) -> float:
+        """Get time spent in current state in seconds."""
+        import time
+        if self._state_entry_time is None:
+            return 0.0
+        return time.time() - self._state_entry_time
+    
+    def _update_state_tracking(self, new_state: EmotionalState) -> None:
+        """Update state tracking when transitioning."""
+        import time
+        self._current_tracked_state = new_state
+        self._state_entry_time = time.time()
+    
     def infer(self) -> Optional[EmotionalState]:
         """
         Run inference and return new state if transition should occur.
@@ -117,12 +148,20 @@ class InferenceEngine:
         Steps:
         1. Evaluate all rules against current KB
         2. Select highest-priority matching rule
-        3. Check if transition is valid in state space
-        4. Return target state (or None if no transition)
+        3. CHECK THROTTLE: Block if in state < MIN_DURATION (unless high priority)
+        4. Check if transition is valid in state space
+        5. Return target state (or None if no transition)
         
         Returns:
             Target emotional state, or None if no transition
         """
+        import time
+        
+        # Initialize state tracking if needed
+        if self._state_entry_time is None and self.state_space:
+            self._current_tracked_state = self.state_space.current_state
+            self._state_entry_time = time.time()
+        
         # Log current KB facts for visibility
         if self.kb.facts:
             print(f"[KB] Facts: {sorted(self.kb.facts)}")
@@ -159,18 +198,38 @@ class InferenceEngine:
         # Check if transition is valid
         if self.state_space:
             current = self.state_space.current_state
+            time_in_state = self._get_time_in_state()
             
-            # Don't transition to same state
+            # === STATE HOLD: If staying in same state, log and return ===
             if target_state == current:
+                # Log state hold for positive states
+                if current == EmotionalState.S5_POSITIVE_STATE:
+                    print(f"[STATE_HOLD] Maintaining {current.name} (engaged or expressive)")
+                
                 self._last_result = InferenceResult(
                     fired_rule=best_rule,
                     new_state=None,
                     matching_rules=matching,
-                    explanation=f"Rule '{best_rule.name}' matched but already in {current.name}"
+                    explanation=f"STATE_HOLD: Staying in {current.name}"
                 )
                 self._history.append(self._last_result)
-                print(f"[INFERENCE] No transition - already in {current.name}")
                 return None
+            
+            # === THROTTLE CHECK: Block rapid transitions ===
+            if time_in_state < self.MIN_STATE_DURATION:
+                # Allow bypass for high-priority rules
+                if best_rule.priority >= self.PRIORITY_BYPASS_THRESHOLD:
+                    print(f"[STATE_THROTTLE] Bypassed (priority {best_rule.priority} >= {self.PRIORITY_BYPASS_THRESHOLD})")
+                else:
+                    print(f"[STATE_BLOCK] Transition blocked (duration={time_in_state:.1f}s < {self.MIN_STATE_DURATION}s)")
+                    self._last_result = InferenceResult(
+                        fired_rule=best_rule,
+                        new_state=None,
+                        matching_rules=matching,
+                        explanation=f"Transition throttled: {time_in_state:.1f}s < {self.MIN_STATE_DURATION}s minimum"
+                    )
+                    self._history.append(self._last_result)
+                    return None
             
             # Check if transition is valid in state space
             valid_targets = {t.to_state for t in self.state_space.get_valid_transitions()}
@@ -179,13 +238,15 @@ class InferenceEngine:
                     fired_rule=best_rule,
                     new_state=None,
                     matching_rules=matching,
-                    explanation=f"Rule '{best_rule.name}' matched but transition to {target_state.name} not valid from {current.name}"
+                    explanation=f"Transition to {target_state.name} not valid from {current.name}"
                 )
                 self._history.append(self._last_result)
                 print(f"[INFERENCE] Transition blocked - {target_state.name} not reachable from {current.name}")
                 return None
         
-        # Inference successful
+        # Inference successful - update state tracking
+        self._update_state_tracking(target_state)
+        
         self._last_result = InferenceResult(
             fired_rule=best_rule,
             new_state=target_state,
@@ -194,7 +255,7 @@ class InferenceEngine:
         )
         self._history.append(self._last_result)
         
-        print(f"[INFERENCE] \033[32mFIRING\033[0m {best_rule.name} → {target_state.name}")
+        print(f"[STATE] \033[32mTRANSITION\033[0m {self._current_tracked_state} → {target_state.name}")
         
         return target_state
     
