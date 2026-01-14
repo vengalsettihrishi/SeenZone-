@@ -17,9 +17,11 @@ Privacy: All processing is LOCAL. Frames are never transmitted externally.
 """
 
 import numpy as np
-from dataclasses import dataclass
-from typing import Optional, Tuple, List
+from dataclasses import dataclass, field
+from typing import Optional, Tuple, List, Dict
+from collections import deque
 import cv2
+import time
 
 try:
     import mediapipe as mp
@@ -52,6 +54,16 @@ class AffectiveCues:
         gaze_ratio: Horizontal gaze position (0=left, 0.5=center, 1=right)
         mouth_aspect_ratio: Mouth openness (0=closed, higher=open)
         brow_height: Normalized eyebrow height (higher=raised)
+        
+        # NEW: Expressiveness variables
+        smile_ratio: Lip corner distance / face width (higher = smiling)
+        mouth_activity: Temporal change in mouth landmarks
+        cheek_raise: Cheek-to-eye distance change (genuine smile indicator)
+        
+        # NEW: Attention/engagement variables
+        gaze_stability: Variance of gaze over N frames (higher = more stable)
+        blink_rate: Blinks detected per second
+        motion_energy: Overall landmark movement over time
     """
     face_detected: bool = False
     face_confidence: float = 0.0
@@ -74,6 +86,16 @@ class AffectiveCues:
     # Brow
     brow_height: float = 0.0
     
+    # NEW: Expressiveness variables
+    smile_ratio: float = 0.0           # Lip corner distance / face width
+    mouth_activity: float = 0.0        # Temporal change in mouth landmarks
+    cheek_raise: float = 0.0           # Cheek-to-eye distance change
+    
+    # NEW: Attention/engagement variables
+    gaze_stability: float = 0.5        # Variance of gaze over N frames (higher = stable)
+    blink_rate: float = 0.0            # Blinks detected per second
+    motion_energy: float = 0.0         # Overall landmark movement over time
+    
     @property
     def avg_eye_aspect_ratio(self) -> float:
         """Average eye aspect ratio across both eyes."""
@@ -91,7 +113,16 @@ class AffectiveCues:
             "gaze_ratio": round(self.gaze_ratio, 3),
             "mouth_aspect_ratio": round(self.mouth_aspect_ratio, 3),
             "brow_height": round(self.brow_height, 3),
+            # NEW: Expressiveness
+            "smile_ratio": round(self.smile_ratio, 3),
+            "mouth_activity": round(self.mouth_activity, 3),
+            "cheek_raise": round(self.cheek_raise, 3),
+            # NEW: Attention
+            "gaze_stability": round(self.gaze_stability, 3),
+            "blink_rate": round(self.blink_rate, 3),
+            "motion_energy": round(self.motion_energy, 3),
         }
+
 
 
 # =============================================================================
@@ -140,6 +171,268 @@ class LandmarkIndices:
 
 
 # =============================================================================
+# BASELINE CALIBRATOR (LAPTOP-AWARE)
+# =============================================================================
+
+class BaselineCalibrator:
+    """
+    Captures baseline head pose during first ~2 seconds of operation.
+    
+    This eliminates the laptop camera bias where head pitch is always
+    slightly negative due to camera position below eye level.
+    
+    All subsequent measurements are compared relative to baseline.
+    """
+    
+    def __init__(self, calibration_frames: int = 60):
+        """
+        Initialize calibrator.
+        
+        Args:
+            calibration_frames: Number of frames to collect (~2 seconds at 30fps)
+        """
+        self.calibration_frames = calibration_frames
+        self.samples: List[Dict[str, float]] = []
+        self.baseline: Optional[Dict[str, float]] = None
+        self.is_calibrated: bool = False
+        print(f"[BaselineCalibrator] Initialized (calibration_frames={calibration_frames})")
+    
+    def add_sample(self, cues: 'AffectiveCues') -> bool:
+        """
+        Add a sample during calibration phase.
+        
+        Args:
+            cues: Current affective cues
+            
+        Returns:
+            True if calibration just completed, False otherwise
+        """
+        if self.is_calibrated:
+            return False
+        
+        if not cues.face_detected:
+            return False
+        
+        self.samples.append({
+            'head_pitch': cues.head_pitch,
+            'head_yaw': cues.head_yaw,
+            'gaze_ratio': cues.gaze_ratio,
+        })
+        
+        if len(self.samples) >= self.calibration_frames:
+            self._finalize_calibration()
+            return True
+        
+        return False
+    
+    def _finalize_calibration(self) -> None:
+        """Calculate baseline from collected samples."""
+        if not self.samples:
+            return
+        
+        self.baseline = {
+            'head_pitch': np.mean([s['head_pitch'] for s in self.samples]),
+            'head_yaw': np.mean([s['head_yaw'] for s in self.samples]),
+            'gaze_ratio': np.mean([s['gaze_ratio'] for s in self.samples]),
+        }
+        self.is_calibrated = True
+        
+        print(f"[BASELINE] Calibration complete:")
+        print(f"[BASELINE] head_pitch={self.baseline['head_pitch']:.3f}")
+        print(f"[BASELINE] head_yaw={self.baseline['head_yaw']:.3f}")
+        print(f"[BASELINE] gaze={self.baseline['gaze_ratio']:.3f}")
+    
+    def get_baseline(self) -> Dict[str, float]:
+        """Get baseline values (returns zeros if not calibrated)."""
+        if self.baseline:
+            return self.baseline.copy()
+        return {'head_pitch': 0.0, 'head_yaw': 0.0, 'gaze_ratio': 0.5}
+    
+    def get_delta(self, cues: 'AffectiveCues') -> Dict[str, float]:
+        """
+        Get delta from baseline for current cues.
+        
+        Args:
+            cues: Current affective cues
+            
+        Returns:
+            Dictionary with delta values
+        """
+        baseline = self.get_baseline()
+        return {
+            'pitch_delta': cues.head_pitch - baseline['head_pitch'],
+            'yaw_delta': cues.head_yaw - baseline['head_yaw'],
+            'gaze_delta': cues.gaze_ratio - baseline['gaze_ratio'],
+        }
+    
+    def reset(self) -> None:
+        """Reset calibration."""
+        self.samples.clear()
+        self.baseline = None
+        self.is_calibrated = False
+        print("[BaselineCalibrator] Reset")
+
+
+# =============================================================================
+# TEMPORAL TRACKER
+# =============================================================================
+
+class TemporalTracker:
+    """
+    Tracks temporal dynamics across frames for attention/engagement signals.
+    
+    Provides:
+    - Gaze stability (variance over time)
+    - Blink detection and rate
+    - Motion energy (overall movement)
+    - Mouth activity
+    """
+    
+    def __init__(self, window_size: int = 30):
+        """
+        Initialize tracker.
+        
+        Args:
+            window_size: Number of frames for rolling window (~1 second at 30fps)
+        """
+        self.window_size = window_size
+        
+        # Rolling windows for different metrics
+        self.gaze_history: deque = deque(maxlen=window_size)
+        self.ear_history: deque = deque(maxlen=window_size)
+        self.mouth_history: deque = deque(maxlen=window_size)
+        self.pose_history: deque = deque(maxlen=window_size)
+        
+        # Blink detection state
+        self.blink_timestamps: deque = deque(maxlen=50)
+        self.last_ear: float = 0.3
+        self.in_blink: bool = False
+        self.blink_ear_threshold: float = 0.20
+        
+        # Timing
+        self.last_update_time: float = time.time()
+        
+        print(f"[TemporalTracker] Initialized (window_size={window_size})")
+    
+    def update(self, cues: 'AffectiveCues') -> None:
+        """
+        Update tracker with new frame data.
+        
+        Args:
+            cues: Current affective cues
+        """
+        if not cues.face_detected:
+            return
+        
+        current_time = time.time()
+        
+        # Update histories
+        self.gaze_history.append(cues.gaze_ratio)
+        self.ear_history.append(cues.avg_eye_aspect_ratio)
+        self.mouth_history.append(cues.mouth_aspect_ratio)
+        self.pose_history.append((cues.head_pitch, cues.head_yaw, cues.head_roll))
+        
+        # Blink detection
+        ear = cues.avg_eye_aspect_ratio
+        if not self.in_blink and ear < self.blink_ear_threshold:
+            self.in_blink = True
+        elif self.in_blink and ear > self.blink_ear_threshold + 0.05:
+            self.in_blink = False
+            self.blink_timestamps.append(current_time)
+        
+        self.last_ear = ear
+        self.last_update_time = current_time
+    
+    def get_gaze_stability(self) -> float:
+        """
+        Calculate gaze stability (0 = unstable, 1 = very stable).
+        
+        Returns:
+            Stability score based on inverse variance
+        """
+        if len(self.gaze_history) < 5:
+            return 0.5
+        
+        variance = np.var(list(self.gaze_history))
+        # Convert variance to 0-1 stability score (lower variance = higher stability)
+        # Variance of 0 → stability 1.0, variance of 0.1+ → stability ~0
+        stability = 1.0 / (1.0 + variance * 50)
+        return min(1.0, max(0.0, stability))
+    
+    def get_blink_rate(self) -> float:
+        """
+        Calculate blinks per second over recent window.
+        
+        Returns:
+            Blinks per second
+        """
+        if not self.blink_timestamps:
+            return 0.0
+        
+        current_time = time.time()
+        # Count blinks in last 10 seconds
+        window_seconds = 10.0
+        recent_blinks = sum(1 for t in self.blink_timestamps 
+                           if current_time - t < window_seconds)
+        
+        return recent_blinks / window_seconds
+    
+    def get_motion_energy(self) -> float:
+        """
+        Calculate overall motion energy from pose changes.
+        
+        Returns:
+            Motion energy score (0 = still, 1 = high movement)
+        """
+        if len(self.pose_history) < 5:
+            return 0.0
+        
+        poses = list(self.pose_history)
+        
+        # Calculate frame-to-frame differences
+        diffs = []
+        for i in range(1, len(poses)):
+            prev = poses[i-1]
+            curr = poses[i]
+            diff = sum((c - p) ** 2 for c, p in zip(curr, prev))
+            diffs.append(diff)
+        
+        if not diffs:
+            return 0.0
+        
+        # Average motion and scale to 0-1
+        avg_motion = np.mean(diffs)
+        # Scale: 0.01 motion → ~0.5 energy
+        energy = min(1.0, avg_motion * 50)
+        return energy
+    
+    def get_mouth_activity(self) -> float:
+        """
+        Calculate mouth movement activity.
+        
+        Returns:
+            Activity score (0 = still, 1 = high activity)
+        """
+        if len(self.mouth_history) < 5:
+            return 0.0
+        
+        variance = np.var(list(self.mouth_history))
+        # Scale variance to 0-1 activity score
+        activity = min(1.0, variance * 100)
+        return activity
+    
+    def reset(self) -> None:
+        """Reset all tracking."""
+        self.gaze_history.clear()
+        self.ear_history.clear()
+        self.mouth_history.clear()
+        self.pose_history.clear()
+        self.blink_timestamps.clear()
+        self.in_blink = False
+        print("[TemporalTracker] Reset")
+
+
+# =============================================================================
 # CV PROCESSOR CLASS
 # =============================================================================
 
@@ -154,6 +447,8 @@ class CVProcessor:
     - Gaze direction
     - Mouth state
     - Eyebrow position
+    - NEW: Smile ratio, cheek raise (expressiveness)
+    - NEW: Temporal dynamics via BaselineCalibrator and TemporalTracker
     
     All processing is performed locally. No data is transmitted externally.
     """
@@ -161,7 +456,8 @@ class CVProcessor:
     def __init__(self, 
                  min_detection_confidence: float = 0.5,
                  min_tracking_confidence: float = 0.5,
-                 refine_landmarks: bool = True):
+                 refine_landmarks: bool = True,
+                 calibration_frames: int = 60):
         """
         Initialize the CV processor.
         
@@ -169,6 +465,7 @@ class CVProcessor:
             min_detection_confidence: Minimum face detection confidence
             min_tracking_confidence: Minimum tracking confidence
             refine_landmarks: Whether to refine eye/lip landmarks
+            calibration_frames: Frames for baseline calibration (~2 seconds)
         """
         self.enabled = MEDIAPIPE_AVAILABLE
         
@@ -189,6 +486,15 @@ class CVProcessor:
         self.mp_drawing = mp.solutions.drawing_utils
         self.mp_drawing_styles = mp.solutions.drawing_styles
         
+        # NEW: Baseline calibrator (laptop-aware)
+        self.calibrator = BaselineCalibrator(calibration_frames=calibration_frames)
+        
+        # NEW: Temporal tracker for dynamics
+        self.tracker = TemporalTracker(window_size=30)
+        
+        # Frame counter for logging
+        self._frame_count = 0
+        
         print(f"[CVProcessor] Initialized (detection={min_detection_confidence}, tracking={min_tracking_confidence})")
     
     def process(self, frame: np.ndarray) -> AffectiveCues:
@@ -201,8 +507,6 @@ class CVProcessor:
         Returns:
             AffectiveCues containing all extracted measurements
         """
-        import time
-        
         cues = AffectiveCues()
         
         if not self.enabled or frame is None:
@@ -220,8 +524,6 @@ class CVProcessor:
         mp_time = (time.perf_counter() - mp_start) * 1000
         
         # Log MediaPipe timing periodically (every ~30 frames to reduce noise)
-        if not hasattr(self, '_frame_count'):
-            self._frame_count = 0
         self._frame_count += 1
         if self._frame_count % 30 == 0:
             print(f"[TIMING] MediaPipe: {mp_time:.1f}ms (convert: {convert_time:.1f}ms)")
@@ -240,7 +542,7 @@ class CVProcessor:
         # Get frame dimensions
         h, w = frame.shape[:2]
         
-        # Extract cues
+        # Extract basic cues
         cues.head_pitch, cues.head_yaw, cues.head_roll = self._estimate_head_pose(landmarks, w, h)
         cues.left_eye_aspect_ratio = self._calculate_eye_aspect_ratio(landmarks, LandmarkIndices.LEFT_EYE)
         cues.right_eye_aspect_ratio = self._calculate_eye_aspect_ratio(landmarks, LandmarkIndices.RIGHT_EYE)
@@ -248,7 +550,43 @@ class CVProcessor:
         cues.mouth_aspect_ratio = self._calculate_mouth_aspect_ratio(landmarks)
         cues.brow_height = self._calculate_brow_height(landmarks)
         
+        # NEW: Expressiveness cues
+        cues.smile_ratio = self._calculate_smile_ratio(landmarks)
+        cues.cheek_raise = self._calculate_cheek_raise(landmarks)
+        
+        # NEW: Baseline calibration (first ~2 seconds)
+        if not self.calibrator.is_calibrated:
+            just_calibrated = self.calibrator.add_sample(cues)
+            if just_calibrated:
+                print("[CVProcessor] Baseline calibration complete!")
+        
+        # NEW: Update temporal tracker
+        self.tracker.update(cues)
+        
+        # NEW: Get temporal dynamics from tracker
+        cues.gaze_stability = self.tracker.get_gaze_stability()
+        cues.blink_rate = self.tracker.get_blink_rate()
+        cues.motion_energy = self.tracker.get_motion_energy()
+        cues.mouth_activity = self.tracker.get_mouth_activity()
+        
         return cues
+    
+    def get_baseline(self) -> Dict[str, float]:
+        """Get the calibrated baseline values."""
+        return self.calibrator.get_baseline()
+    
+    def get_baseline_delta(self, cues: AffectiveCues) -> Dict[str, float]:
+        """Get the delta from baseline for current cues."""
+        return self.calibrator.get_delta(cues)
+    
+    def is_calibrated(self) -> bool:
+        """Check if baseline calibration is complete."""
+        return self.calibrator.is_calibrated
+    
+    def reset_calibration(self) -> None:
+        """Reset baseline calibration."""
+        self.calibrator.reset()
+        self.tracker.reset()
     
     def _estimate_confidence(self, landmarks) -> float:
         """Estimate detection confidence from landmark visibility."""
@@ -380,6 +718,69 @@ class CVProcessor:
         
         # Normalize to roughly 0-1 range
         return max(0, min(1, brow_distance * 10 + 0.5))
+    
+    def _calculate_smile_ratio(self, landmarks) -> float:
+        """
+        Calculate smile ratio based on mouth corner positions.
+        
+        Higher value = more of a smile (lip corners pulled up/out)
+        """
+        # Mouth corners
+        left_corner = landmarks[LandmarkIndices.MOUTH_LEFT]
+        right_corner = landmarks[LandmarkIndices.MOUTH_RIGHT]
+        
+        # Use face width for normalization (approximate with outer eye corners)
+        left_face = landmarks[LandmarkIndices.LEFT_EYE_OUTER]
+        right_face = landmarks[LandmarkIndices.RIGHT_EYE_OUTER]
+        
+        face_width = np.sqrt((left_face.x - right_face.x)**2 + (left_face.y - right_face.y)**2)
+        if face_width == 0:
+            return 0.0
+        
+        # Mouth width
+        mouth_width = np.sqrt((left_corner.x - right_corner.x)**2 + (left_corner.y - right_corner.y)**2)
+        
+        # Smile ratio: mouth width relative to face width
+        # Smiling typically increases this ratio
+        smile_ratio = mouth_width / face_width
+        
+        # Normalize to 0-1 range (typical range is 0.4-0.7)
+        normalized = (smile_ratio - 0.4) / 0.3
+        return max(0, min(1, normalized))
+    
+    def _calculate_cheek_raise(self, landmarks) -> float:
+        """
+        Calculate cheek raise (Duchenne smile indicator).
+        
+        A genuine smile involves raising of the cheeks, causing eye area compression.
+        This measures the vertical distance between cheek and lower eye.
+        
+        Higher value = more cheek raise (genuine smile indicator)
+        """
+        # Cheek landmarks (approximate using face mesh points near cheekbone)
+        # Using points around the lower eye area
+        left_cheek_idx = 50   # Near left cheek
+        right_cheek_idx = 280  # Near right cheek
+        
+        left_cheek = landmarks[left_cheek_idx]
+        right_cheek = landmarks[right_cheek_idx]
+        
+        # Lower eye landmarks
+        left_lower_eye = landmarks[LandmarkIndices.LEFT_EYE_BOTTOM]
+        right_lower_eye = landmarks[LandmarkIndices.RIGHT_EYE_BOTTOM]
+        
+        # Calculate vertical distance (y increases downward in image coords)
+        # When cheeks are raised, cheek moves up (y decreases), closer to eye
+        left_distance = left_cheek.y - left_lower_eye.y
+        right_distance = right_cheek.y - right_lower_eye.y
+        
+        avg_distance = (left_distance + right_distance) / 2
+        
+        # Normalize: smaller distance = higher cheek raise
+        # Typical range is 0.03-0.08 in normalized coords
+        # Invert so higher = more raise
+        normalized = 1.0 - (avg_distance - 0.02) / 0.06
+        return max(0, min(1, normalized))
     
     def draw_landmarks(self, frame: np.ndarray, cues: Optional[AffectiveCues] = None) -> np.ndarray:
         """

@@ -200,11 +200,48 @@ def create_default_rules() -> List[Rule]:
     These rules map CV-derived predicates to emotional state transitions.
     Rules are ordered by priority for conflict resolution.
     
+    NEW: Uses relative predicates (laptop-aware) and multi-signal detection.
+    Positive override rules have higher priority than negative detection.
+    
     Returns:
         List of default rules
     """
     rules = [
-        # === HIGH PRIORITY: Distress signals ===
+        # =================================================================
+        # HIGHEST PRIORITY: POSITIVE OVERRIDE RULES (Priority 6-7)
+        # These take precedence over negative state detection
+        # =================================================================
+        
+        Rule(
+            name="positive_override_expressive",
+            conditions=[
+                Predicate("Present"),
+                Predicate("Smiling"),
+                Predicate("ExpressiveFace"),
+                Predicate("Active"),
+            ],
+            target_state=EmotionalState.S5_POSITIVE_STATE,
+            priority=7,
+            description="OVERRIDE: Smiling + expressive + active → positive (blocks sadness)"
+        ),
+        
+        Rule(
+            name="positive_smiling_engaged",
+            conditions=[
+                Predicate("Present"),
+                Predicate("Smiling"),
+                Predicate("Engaged"),
+                Predicate("ShowsTension", negated=True),
+            ],
+            target_state=EmotionalState.S5_POSITIVE_STATE,
+            priority=6,
+            description="OVERRIDE: Smiling + engaged → positive"
+        ),
+        
+        # =================================================================
+        # HIGH PRIORITY: DISTRESS SIGNALS (Priority 5)
+        # =================================================================
+        
         Rule(
             name="detect_distressed_silent",
             conditions=[
@@ -229,17 +266,37 @@ def create_default_rules() -> List[Rule]:
             description="User showing tension without attention"
         ),
         
-        # === MEDIUM PRIORITY: Mood indicators ===
+        # =================================================================
+        # MEDIUM PRIORITY: MOOD INDICATORS (Priority 3)
+        # NEW: Multi-signal sadness requires BOTH relative head lowered AND low energy
+        # =================================================================
+        
         Rule(
-            name="detect_sadness",
+            name="detect_sadness_robust",
             conditions=[
                 Predicate("Present"),
-                Predicate("HeadDown"),
+                Predicate("HeadLoweredSignificantly"),  # RELATIVE to baseline
+                Predicate("LowMotionEnergy"),            # Multi-signal requirement
                 Predicate("Speaking", negated=True),
+                Predicate("Smiling", negated=True),      # Block if smiling
             ],
             target_state=EmotionalState.S1_SADNESS_DETECTED,
             priority=3,
-            description="User with head down, not speaking"
+            description="ROBUST: Head lowered (relative) + low energy + not smiling → sadness"
+        ),
+        
+        Rule(
+            name="detect_sadness_disengaged",
+            conditions=[
+                Predicate("Present"),
+                Predicate("HeadLoweredSignificantly"),
+                Predicate("Engaged", negated=True),
+                Predicate("ExpressiveFace", negated=True),
+                Predicate("Smiling", negated=True),
+            ],
+            target_state=EmotionalState.S1_SADNESS_DETECTED,
+            priority=3,
+            description="Head lowered (relative) + disengaged + not expressive → sadness"
         ),
         
         Rule(
@@ -254,7 +311,10 @@ def create_default_rules() -> List[Rule]:
             description="User showing fatigue without attentiveness"
         ),
         
-        # === POSITIVE STATES ===
+        # =================================================================
+        # POSITIVE STATES (Priority 2)
+        # =================================================================
+        
         Rule(
             name="detect_positive",
             conditions=[
@@ -282,17 +342,21 @@ def create_default_rules() -> List[Rule]:
             description="User fully engaged, attentive, relaxed — goal state"
         ),
         
-        # === BASELINE ===
+        # =================================================================
+        # BASELINE (Priority 0)
+        # NEW: Uses relative predicate instead of absolute HeadDown
+        # =================================================================
+        
         Rule(
             name="neutral_baseline",
             conditions=[
                 Predicate("Present"),
                 Predicate("ShowsTension", negated=True),
-                Predicate("HeadDown", negated=True),
+                Predicate("HeadLoweredSignificantly", negated=True),  # RELATIVE - laptop-aware
             ],
             target_state=EmotionalState.S0_NEUTRAL,
             priority=0,
-            description="User present with neutral indicators"
+            description="User present with neutral indicators (laptop-aware)"
         ),
     ]
     

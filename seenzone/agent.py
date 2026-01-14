@@ -161,12 +161,19 @@ class SeenZoneAgent:
                 cues = self.cv_processor.process(env_state.visual_frame)
                 
                 if self.cue_interpreter:
-                    predicates = self.cue_interpreter.interpret(cues)
+                    # NEW: Get baseline delta for laptop-aware detection
+                    baseline_delta = None
+                    if self.cv_processor.is_calibrated():
+                        baseline_delta = self.cv_processor.get_baseline_delta(cues)
+                    
+                    # Pass baseline delta to interpreter for relative predicates
+                    predicates = self.cue_interpreter.interpret(cues, baseline_delta)
                     env_state.visual_cues = {
                         "raw": cues.to_dict(),
                         "predicates": predicates.to_dict(),
                         "fol": predicates.to_fol_predicates(),
-                        "summary": self.cue_interpreter.get_summary(predicates)
+                        "summary": self.cue_interpreter.get_summary(predicates),
+                        "sadness_evidence": predicates.sadness_evidence_count  # NEW: For logging
                     }
         
         # Collect from text sensor (if available)
@@ -178,7 +185,8 @@ class SeenZoneAgent:
             has_visual = "✓" if env_state.has_visual() else "✗"
             has_text = "✓" if env_state.has_text() else "✗"
             has_cues = "✓" if env_state.visual_cues else "✗"
-            print(f"[Perceive] Visual:{has_visual} Text:{has_text} Cues:{has_cues}")
+            calibrated = "✓" if self.cv_processor and self.cv_processor.is_calibrated() else "⏳"
+            print(f"[Perceive] Visual:{has_visual} Text:{has_text} Cues:{has_cues} Baseline:{calibrated}")
             
             # Print cue summary if available
             if env_state.visual_cues:
