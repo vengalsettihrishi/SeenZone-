@@ -330,18 +330,6 @@ class CueInterpreter:
         predicates.is_active = cues.motion_energy > t.motion_energy_high
         predicates.low_motion_energy = cues.motion_energy < t.motion_energy_low
         
-        # === LOGGING: FACE EXPRESSIVENESS ===
-        if should_log:
-            print(f"[CV_FACE] smile_ratio={cues.smile_ratio:.2f} "
-                  f"cheek_raise={cues.cheek_raise:.2f} "
-                  f"mouth_activity={cues.mouth_activity:.2f}")
-        
-        # === LOGGING: ATTENTION ===
-        if should_log:
-            print(f"[CV_ATTENTION] gaze_stability={cues.gaze_stability:.2f} "
-                  f"blink_rate={cues.blink_rate:.2f} "
-                  f"motion_energy={cues.motion_energy:.2f}")
-        
         # =================================================================
         # DERIVED PREDICATES (Engagement & Attentiveness)
         # These are the KEY predicates that rules use for positive states
@@ -385,52 +373,7 @@ class CueInterpreter:
             (predicates.cheek_raised and predicates.expressive_face)
         )
         
-        # === LOGGING: VALENCE (CRITICAL) ===
-        if should_log:
-            valence_reason = []
-            if predicates.is_smiling:
-                valence_reason.append("Smiling")
-            if predicates.cheek_raised:
-                valence_reason.append("CheekRaised")
-            if predicates.expressive_face:
-                valence_reason.append("ExpressiveFace")
-            
-            if predicates.positive_valence:
-                print(f"[DERIVED] PositiveValence=True ({' ∧ '.join(valence_reason)})")
-            else:
-                print(f"[DERIVED] PositiveValence=False (missing smile or cheek+expression)")
-        
-        # === LOGGING: DERIVED PREDICATES (MANDATORY) ===
-        if should_log:
-            # Engaged reasoning
-            engaged_reason = []
-            if predicates.is_present:
-                engaged_reason.append("Present")
-            if predicates.gaze_stable:
-                engaged_reason.append("GazeStable")
-            if predicates.is_active:
-                engaged_reason.append("Active")
-            if predicates.expressive_face:
-                engaged_reason.append("ExpressiveFace")
-            if predicates.is_smiling:
-                engaged_reason.append("Smiling")
-            
-            print(f"[DERIVED] Engaged={predicates.is_engaged} "
-                  f"({' ∧ '.join(engaged_reason) if engaged_reason else 'no signals'})")
-            
-            # Attentive reasoning
-            attentive_parts = []
-            if predicates.gaze_stable:
-                attentive_parts.append("GazeStable")
-            if not predicates.is_looking_away:
-                attentive_parts.append("NOT LookingAway")
-            else:
-                attentive_parts.append("LookingAway=True")
-            
-            print(f"[DERIVED] Attentive={predicates.is_attentive} "
-                  f"({' ∧ '.join(attentive_parts)})")
-        
-        # === NEW: SADNESS EVIDENCE COUNTING (MULTI-SIGNAL) ===
+        # === SADNESS EVIDENCE COUNTING (MULTI-SIGNAL) ===
         sadness_signals = 0
         if predicates.head_lowered_significantly:
             sadness_signals += 1
@@ -441,31 +384,7 @@ class CueInterpreter:
         
         predicates.sadness_evidence_count = sadness_signals
         
-        if should_log:
-            print(f"[SADNESS_EVIDENCE] signals={sadness_signals}/3 "
-                  f"→ {'BLOCK sadness' if sadness_signals < 2 else 'allow sadness'}")
-        
-        # === LOGGING: CUES SUMMARY ===
-        if should_log:
-            cues_list = []
-            if predicates.head_lowered_significantly:
-                cues_list.append("HeadLoweredSignificantly")
-            if predicates.is_smiling:
-                cues_list.append("Smiling")
-            if predicates.expressive_face:
-                cues_list.append("ExpressiveFace")
-            if predicates.is_active:
-                cues_list.append("Active")
-            if predicates.low_motion_energy:
-                cues_list.append("LowMotionEnergy")
-            if predicates.gaze_stable:
-                cues_list.append("GazeStable")
-            if predicates.is_engaged:
-                cues_list.append("Engaged")
-            if predicates.is_attentive:
-                cues_list.append("Attentive")
-            print(f"[CUES] {', '.join(cues_list) if cues_list else 'None'}")
-        
+
         # === ENGAGEMENT LEVEL ===
         if predicates.is_engaged and predicates.is_attentive:
             predicates.engagement_level = "high"

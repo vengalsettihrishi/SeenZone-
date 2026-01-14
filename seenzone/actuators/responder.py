@@ -54,6 +54,20 @@ PLACEHOLDER_RESPONSES: Dict[EmotionalState, str] = {
 
 
 # =============================================================================
+# AFFECT LABEL FALLBACK RESPONSES (Continuous Affect Model)
+# =============================================================================
+
+# Affect label → Fallback response (when LLM is unavailable)
+AFFECT_PLACEHOLDER_RESPONSES: Dict[str, str] = {
+    "Positive": "It's nice to see you smiling. I'm here with you.",
+    "Uncertain": "I'm here with you.",
+    "Sad": "I'm here if you'd like to talk. No pressure.",
+    "Stressed": "Let's take a moment. I'm here.",
+    "Distressed": "I'm here whenever you're ready. No rush.",
+}
+
+
+# =============================================================================
 # LLM RESPONDER
 # =============================================================================
 
@@ -117,15 +131,22 @@ class LLMResponder(Actuator):
     
     def generate_response(self, state: EmotionalState, cues: List[str]) -> str:
         """
-        Generate an empathetic response for the given state.
+        Generate an empathetic response for the given state/affect.
         
         Args:
-            state: Current emotional state (authoritative)
-            cues: Supporting FOL predicates from CV
+            state: Current emotional state (fallback for FSM mode)
+            cues: Supporting cues - may include AffectLabel(X) for affect mode
             
         Returns:
             Generated response text
         """
+        # Extract affect label from cues if present
+        affect_label = None
+        for cue in cues:
+            if cue.startswith("AffectLabel("):
+                affect_label = cue[12:-1]  # Extract label from AffectLabel(X)
+                break
+        
         # Try LLM generation
         if self.is_llm_available():
             response = self._generate_llm_response(state, cues)
@@ -138,8 +159,8 @@ class LLMResponder(Actuator):
                 
                 return response
         
-        # Fallback to placeholder
-        return self._get_fallback_response(state)
+        # Fallback to placeholder (prefer affect label over FSM state)
+        return self._get_fallback_response(state, affect_label)
     
     def _generate_llm_response(self, state: EmotionalState, cues: List[str]) -> Optional[str]:
         """Generate response via LLM."""
@@ -152,14 +173,27 @@ class LLMResponder(Actuator):
         
         return response
     
-    def _get_fallback_response(self, state: EmotionalState) -> str:
-        """Get state-aware fallback response."""
+    def _get_fallback_response(self, state: EmotionalState, affect_label: str = None) -> str:
+        """
+        Get fallback response.
+        
+        Args:
+            state: FSM state (fallback)
+            affect_label: Affect label (preferred if available)
+            
+        Returns:
+            Fallback response string
+        """
         self._fallback_count += 1
         
-        response = PLACEHOLDER_RESPONSES.get(
-            state, 
-            PLACEHOLDER_RESPONSES[EmotionalState.S0_NEUTRAL]
-        )
+        # Prefer affect label responses
+        if affect_label and affect_label in AFFECT_PLACEHOLDER_RESPONSES:
+            response = AFFECT_PLACEHOLDER_RESPONSES[affect_label]
+        else:
+            response = PLACEHOLDER_RESPONSES.get(
+                state, 
+                PLACEHOLDER_RESPONSES[EmotionalState.S0_NEUTRAL]
+            )
         
         self._last_response = response
         return response

@@ -195,182 +195,20 @@ class RuleEngine:
 
 def create_default_rules() -> List[Rule]:
     """
-    Create the default rule set for SeenZone.
+    DEPRECATED: Emotion detection now uses continuous affect model.
     
-    DESIGN PRINCIPLE:
-    - Engagement ≠ Happiness
-    - Activity ≠ Positivity  
-    - Valence must be explicitly earned and maintained
+    The AffectProcessor in seenzone/reasoning/affect_processor.py handles
+    emotion detection via continuous valence/arousal/engagement with EMA smoothing.
     
-    PositiveValence is REQUIRED for S5_POSITIVE_STATE.
-    Neutral is the default for attentive but non-smiling users.
+    Rules are no longer used for emotion detection. This function returns
+    an empty list. Keep for backward compatibility only.
     
-    PRIORITY DESIGN:
-    - 8: State maintenance (requires valence to persist)
-    - 7: Positive with strong valence evidence
-    - 6: Positive with valence + engagement
-    - 5: Distress signals
-    - 4: High stress
-    - 3: Sadness (multi-signal)
-    - 2: Goal stabilization
-    - 1: Neutral attentive (engaged but no valence)
-    - 0: Neutral inactive
+    If FSM-based state policy is needed (e.g., response pacing, UX coherence),
+    add minimal state transition rules here - but NOT emotion detection rules.
     
     Returns:
-        List of default rules
+        Empty list (no default rules)
     """
-    rules = [
-        # =================================================================
-        # STATE MAINTENANCE (Priority 8) — REQUIRES VALENCE
-        # Only maintain positive state if valence persists
-        # =================================================================
-        
-        Rule(
-            name="maintain_positive_with_valence",
-            conditions=[
-                Predicate("Present"),
-                Predicate("PositiveValence"),  # VALENCE REQUIRED
-            ],
-            target_state=EmotionalState.S5_POSITIVE_STATE,
-            priority=8,
-            description="STATE_HOLD: Maintain S5 ONLY if PositiveValence persists"
-        ),
-        
-        # =================================================================
-        # POSITIVE STATE ENTRY (Priority 6-7) — ALL REQUIRE VALENCE
-        # =================================================================
-        
-        Rule(
-            name="positive_valence_engaged",
-            conditions=[
-                Predicate("Present"),
-                Predicate("PositiveValence"),  # VALENCE REQUIRED
-                Predicate("Engaged"),
-            ],
-            target_state=EmotionalState.S5_POSITIVE_STATE,
-            priority=7,
-            description="PositiveValence + Engaged → S5"
-        ),
-        
-        Rule(
-            name="positive_valence_attentive",
-            conditions=[
-                Predicate("Present"),
-                Predicate("PositiveValence"),  # VALENCE REQUIRED
-                Predicate("Attentive"),
-            ],
-            target_state=EmotionalState.S5_POSITIVE_STATE,
-            priority=6,
-            description="PositiveValence + Attentive → S5"
-        ),
-        
-        # =================================================================
-        # HIGH PRIORITY: DISTRESS SIGNALS (Priority 5)
-        # =================================================================
-        
-        Rule(
-            name="detect_distressed_silent",
-            conditions=[
-                Predicate("Present"),
-                Predicate("Engaged", negated=True),
-                Predicate("LookingAway"),
-                Predicate("PositiveValence", negated=True),
-            ],
-            target_state=EmotionalState.S6_DISTRESSED_SILENT,
-            priority=5,
-            description="Disengaged + looking away + no valence"
-        ),
-        
-        Rule(
-            name="detect_high_stress",
-            conditions=[
-                Predicate("Present"),
-                Predicate("ShowsTension"),
-                Predicate("Attentive", negated=True),
-                Predicate("PositiveValence", negated=True),
-            ],
-            target_state=EmotionalState.S3_HIGH_STRESS,
-            priority=4,
-            description="Tension + not attentive + no valence"
-        ),
-        
-        # =================================================================
-        # MULTI-SIGNAL SADNESS (Priority 3)
-        # =================================================================
-        
-        Rule(
-            name="detect_sadness_robust",
-            conditions=[
-                Predicate("Present"),
-                Predicate("HeadLoweredSignificantly"),
-                Predicate("LowMotionEnergy"),
-                Predicate("PositiveValence", negated=True),
-            ],
-            target_state=EmotionalState.S1_SADNESS_DETECTED,
-            priority=3,
-            description="Head lowered + low energy + no valence"
-        ),
-        
-        # =================================================================
-        # GOAL STATE (Priority 2)
-        # =================================================================
-        
-        Rule(
-            name="confirm_stability",
-            conditions=[
-                Predicate("Present"),
-                Predicate("PositiveValence"),  # VALENCE REQUIRED
-                Predicate("Engaged"),
-                Predicate("Attentive"),
-                Predicate("ShowsTension", negated=True),
-            ],
-            target_state=EmotionalState.S_GOAL_STABILIZED,
-            priority=2,
-            description="Goal: PositiveValence + engaged + attentive + relaxed"
-        ),
-        
-        # =================================================================
-        # NEUTRAL STATES (Priority 0-1)
-        # Neutral is the DEFAULT for attentive-but-not-positive users
-        # =================================================================
-        
-        Rule(
-            name="neutral_attentive",
-            conditions=[
-                Predicate("Present"),
-                Predicate("Attentive"),
-                Predicate("PositiveValence", negated=True),  # No positive affect
-                Predicate("ShowsTension", negated=True),
-            ],
-            target_state=EmotionalState.S0_NEUTRAL,
-            priority=1,
-            description="NEUTRAL: Attentive but no positive valence (normal laptop use)"
-        ),
-        
-        Rule(
-            name="neutral_engaged",
-            conditions=[
-                Predicate("Present"),
-                Predicate("Engaged"),
-                Predicate("PositiveValence", negated=True),  # No positive affect
-                Predicate("ShowsTension", negated=True),
-            ],
-            target_state=EmotionalState.S0_NEUTRAL,
-            priority=1,
-            description="NEUTRAL: Engaged but no positive valence"
-        ),
-        
-        Rule(
-            name="neutral_baseline",
-            conditions=[
-                Predicate("Present"),
-                Predicate("PositiveValence", negated=True),
-                Predicate("ShowsTension", negated=True),
-            ],
-            target_state=EmotionalState.S0_NEUTRAL,
-            priority=0,
-            description="NEUTRAL: Present, no valence, no tension (fallback)"
-        ),
-    ]
-    
-    return rules
+    print("[RuleEngine] Note: Emotion detection uses AffectProcessor, not rules")
+    return []
+

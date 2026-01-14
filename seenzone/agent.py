@@ -25,6 +25,7 @@ from .state_space import StateSpace, EmotionalState
 from .sensors.cv_processor import CVProcessor, AffectiveCues
 from .sensors.cue_interpreter import CueInterpreter, SymbolicPredicates
 from .reasoning.inference import InferenceEngine
+from .reasoning.affect_processor import AffectProcessor, AffectLabel
 from .actuators.responder import LLMResponder
 
 
@@ -35,7 +36,8 @@ class AgentConfig:
     max_cycles: int = 0                  # 0 = unlimited
     verbose: bool = True                 # Print debug info
     enable_cv: bool = True               # Enable CV processing
-    enable_inference: bool = True        # Enable rule-based inference
+    enable_affect: bool = True           # Enable continuous affect processing
+    enable_inference: bool = False       # Enable rule-based inference (optional, for FSM)
     enable_llm: bool = True              # Enable LLM response generation
 
 
@@ -71,14 +73,20 @@ class SeenZoneAgent:
         self.cv_processor: Optional[CVProcessor] = None
         self.cue_interpreter: Optional[CueInterpreter] = None
         
-        # Inference engine (Sprint 3)
+        # Continuous affect processor (primary emotion detection)
+        self.affect_processor: Optional[AffectProcessor] = None
+        
+        # Inference engine (optional, for FSM state policy)
         self.inference_engine: Optional[InferenceEngine] = None
         
-        # LLM responder (Sprint 4)
+        # LLM responder
         self.llm_responder: Optional[LLMResponder] = None
         
         if self.config.enable_cv:
             self._init_cv_components()
+        
+        if self.config.enable_affect:
+            self._init_affect_processor()
         
         if self.config.enable_inference:
             self._init_inference_engine()
@@ -101,16 +109,25 @@ class SeenZoneAgent:
             self.cue_interpreter = None
     
     def _init_inference_engine(self) -> None:
-        """Initialize the inference engine with default rules."""
+        """Initialize the inference engine (optional, for FSM state policy)."""
         try:
             self.inference_engine = InferenceEngine(
                 state_space=self.state_space,
-                load_default_rules=True
+                load_default_rules=False  # Don't load emotion detection rules
             )
-            print(f"[Agent] Inference engine enabled")
+            print(f"[Agent] Inference engine enabled (FSM mode)")
         except Exception as e:
             print(f"[Agent] Inference engine disabled: {e}")
             self.inference_engine = None
+    
+    def _init_affect_processor(self) -> None:
+        """Initialize the continuous affect processor."""
+        try:
+            self.affect_processor = AffectProcessor()
+            print(f"[Agent] Continuous affect processing enabled")
+        except Exception as e:
+            print(f"[Agent] Affect processing disabled: {e}")
+            self.affect_processor = None
     
     def _init_llm_responder(self) -> None:
         """Initialize the LLM responder for response generation."""
@@ -151,6 +168,9 @@ class SeenZoneAgent:
         """
         env_state = EnvironmentState(timestamp=time.time())
         
+        # Store raw cues for affect processing
+        self._current_raw_cues = None
+        
         # Collect from visual sensor (webcam)
         visual_sensor = self.peas.get_sensor(SensorType.VISUAL)
         if visual_sensor and visual_sensor.is_available():
@@ -159,21 +179,27 @@ class SeenZoneAgent:
             # Extract affective cues via CV processing
             if env_state.visual_frame is not None and self.cv_processor:
                 cues = self.cv_processor.process(env_state.visual_frame)
+                self._current_raw_cues = cues  # Store for affect processor
                 
-                if self.cue_interpreter:
-                    # NEW: Get baseline delta for laptop-aware detection
+                # Process through continuous affect processor (primary)
+                if self.affect_processor:
+                    affect_state = self.affect_processor.process(cues)
+                    env_state.visual_cues = {
+                        "raw": cues.to_dict(),
+                        "affect": affect_state.to_dict(),
+                        "summary": f"{affect_state.label} (conf={affect_state.confidence:.2f})",
+                    }
+                # Fallback to old predicate-based system if no affect processor
+                elif self.cue_interpreter:
                     baseline_delta = None
                     if self.cv_processor.is_calibrated():
                         baseline_delta = self.cv_processor.get_baseline_delta(cues)
-                    
-                    # Pass baseline delta to interpreter for relative predicates
                     predicates = self.cue_interpreter.interpret(cues, baseline_delta)
                     env_state.visual_cues = {
                         "raw": cues.to_dict(),
                         "predicates": predicates.to_dict(),
                         "fol": predicates.to_fol_predicates(),
                         "summary": self.cue_interpreter.get_summary(predicates),
-                        "sadness_evidence": predicates.sadness_evidence_count  # NEW: For logging
                     }
         
         # Collect from text sensor (if available)
@@ -186,11 +212,9 @@ class SeenZoneAgent:
             has_text = "✓" if env_state.has_text() else "✗"
             has_cues = "✓" if env_state.visual_cues else "✗"
             calibrated = "✓" if self.cv_processor and self.cv_processor.is_calibrated() else "⏳"
-            print(f"[Perceive] Visual:{has_visual} Text:{has_text} Cues:{has_cues} Baseline:{calibrated}")
-            
-            # Print cue summary if available
-            if env_state.visual_cues:
-                print(f"[Perceive] {env_state.visual_cues.get('summary', 'No summary')}")
+            # Minimal logging - affect processor logs its own state
+            if not self.affect_processor:
+                print(f"[Perceive] Visual:{has_visual} Text:{has_text} Cues:{has_cues} Baseline:{calibrated}")
         
         return env_state
     
@@ -200,10 +224,11 @@ class SeenZoneAgent:
     
     def reason(self, env_state: EnvironmentState) -> Optional[EmotionalState]:
         """
-        Apply forward-chaining inference to determine state transitions.
+        Determine emotional state from continuous affect processing.
         
         This is the second phase of the P-R-A loop.
-        Uses the inference engine with FOL-style rules.
+        Primary: Uses continuous affect processor (valence/arousal/engagement)
+        Fallback: Uses inference engine with FOL-style rules
         
         Args:
             env_state: Current environment percepts
@@ -213,45 +238,36 @@ class SeenZoneAgent:
         """
         current = self.state_space.current_state
         
-        if self.config.verbose:
-            print(f"[Reason] Current state: {current}")
+        # Primary: Use continuous affect processor
+        if self.affect_processor and env_state.visual_cues and "affect" in env_state.visual_cues:
+            affect_data = env_state.visual_cues["affect"]
+            affect_label = affect_data.get("label", "Uncertain")
+            
+            # Store for act phase
+            self._current_cues = [f"AffectLabel({affect_label})"]
+            
+            # Map affect label to emotional state
+            state_name = self.affect_processor.get_emotional_state_name()
+            try:
+                new_state = EmotionalState[state_name]
+                if new_state != current:
+                    return new_state
+            except KeyError:
+                pass  # Unknown state, stay in current
+            
+            return None
         
-        # Get FOL predicates from CV processing
-        fol_predicates = []
-        if env_state.visual_cues and "fol" in env_state.visual_cues:
-            fol_predicates = env_state.visual_cues["fol"]
-        
-        # Store for act phase (LLM needs these)
-        self._current_cues = fol_predicates
-        
-        if self.config.verbose:
+        # Fallback: Use inference engine (if enabled)
+        if self.inference_engine:
+            fol_predicates = []
+            if env_state.visual_cues and "fol" in env_state.visual_cues:
+                fol_predicates = env_state.visual_cues["fol"]
+            
+            self._current_cues = fol_predicates
+            
             if fol_predicates:
-                print(f"[Reason] KB Facts: {', '.join(fol_predicates)}")
-            else:
-                print(f"[Reason] KB Facts: (none)")
-        
-        # Run inference if engine is available
-        if self.inference_engine and fol_predicates:
-            # Update knowledge base
-            self.inference_engine.update_facts(fol_predicates)
-            
-            # Run inference
-            new_state = self.inference_engine.infer()
-            
-            if self.config.verbose:
-                # Show inference explanation
-                result = self.inference_engine._last_result
-                if result:
-                    if result.fired_rule:
-                        print(f"[Reason] Rule fired: {result.fired_rule.name} (priority={result.fired_rule.priority})")
-                    if result.matching_rules:
-                        print(f"[Reason] Matching rules: {len(result.matching_rules)}")
-                    print(f"[Reason] Result: {result.explanation}")
-            
-            return new_state
-        
-        if self.config.verbose:
-            print(f"[Reason] Inference: skipped (no predicates or engine)")
+                self.inference_engine.update_facts(fol_predicates)
+                return self.inference_engine.infer()
         
         return None
     

@@ -93,6 +93,46 @@ STATE_POLICIES: Dict[EmotionalState, ResponsePolicy] = {
 
 
 # =============================================================================
+# AFFECT LABEL POLICIES (Continuous Affect Model)
+# =============================================================================
+
+# Affect Label → Response Policy mapping
+# These are used when the system runs on continuous affect (not FSM)
+AFFECT_POLICIES: Dict[str, ResponsePolicy] = {
+    "Positive": ResponsePolicy(
+        style="encouraging warmth",
+        tone="bright, affirming, matching their energy",
+        approach="Celebrate the positive moment, be warm and present",
+        avoid="Forced enthusiasm, over-the-top reactions"
+    ),
+    "Uncertain": ResponsePolicy(
+        style="casual presence",
+        tone="warm, relaxed, non-assuming",
+        approach="Light acknowledgment, be available without probing",
+        avoid="Assuming emotions, probing questions"
+    ),
+    "Sad": ResponsePolicy(
+        style="gentle validation",
+        tone="soft, caring, patient",
+        approach="Acknowledge without assuming, offer presence not solutions",
+        avoid="Toxic positivity, forcing conversation, advice-giving"
+    ),
+    "Stressed": ResponsePolicy(
+        style="grounding and calming",
+        tone="steady, reassuring, calm",
+        approach="Acknowledge the difficulty, offer grounding presence",
+        avoid="Adding urgency, pressure, or long suggestions"
+    ),
+    "Distressed": ResponsePolicy(
+        style="gentle re-engagement",
+        tone="soft, non-intrusive",
+        approach="Express presence without demanding response",
+        avoid="Pressure to talk, direct questions"
+    ),
+}
+
+
+# =============================================================================
 # SYSTEM PROMPT
 # =============================================================================
 
@@ -169,12 +209,32 @@ class PromptBuilder:
         """Clear conversation history."""
         self._history.clear()
     
-    def get_state_context(self, state: EmotionalState) -> str:
+    def get_state_context(self, state, affect_label: str = None) -> str:
         """
-        Generate the authoritative state context section.
+        Generate the authoritative context section.
         
-        This is the PRIMARY context — the LLM must respect this.
+        Args:
+            state: EmotionalState (for backward compatibility)
+            affect_label: Affect label string (Positive, Sad, etc.) - takes priority
+        
+        Returns:
+            Context string for LLM prompt
         """
+        # Prefer affect labels over FSM states (continuous affect model)
+        if affect_label and affect_label in AFFECT_POLICIES:
+            policy = AFFECT_POLICIES[affect_label]
+            
+            return f"""PRIMARY CONTEXT (from continuous affect detection):
+- Detected Affect: {affect_label}
+- This was estimated from facial expressions and behavior over time.
+
+Response Policy:
+- Style: {policy.style}
+- Tone: {policy.tone}
+- Approach: {policy.approach}
+- Avoid: {policy.avoid}"""
+        
+        # Fallback to FSM state (backward compatibility)
         state_name = str(state)
         policy = STATE_POLICIES.get(state, STATE_POLICIES[EmotionalState.S0_NEUTRAL])
         
@@ -227,20 +287,29 @@ Response Policy for {state_name}:
     def build(self, 
               state: EmotionalState, 
               cues: List[str],
-              include_history: bool = True) -> str:
+              include_history: bool = True,
+              affect_label: str = None) -> str:
         """
         Build the complete prompt for the LLM.
         
         Args:
-            state: Current emotional state (authoritative)
-            cues: List of FOL predicates from CV
+            state: Current emotional state (for backward compatibility)
+            cues: List of FOL predicates or affect labels from CV
             include_history: Whether to include conversation history
+            affect_label: Direct affect label (Positive, Sad, etc.) - preferred
             
         Returns:
             Complete prompt string
         """
+        # Extract affect label from cues if not provided directly
+        if not affect_label:
+            for cue in cues:
+                if cue.startswith("AffectLabel("):
+                    affect_label = cue[12:-1]  # Extract label from AffectLabel(X)
+                    break
+        
         sections = [
-            self.get_state_context(state),
+            self.get_state_context(state, affect_label),
             "",
             self.get_observations_context(cues),
         ]
@@ -250,7 +319,7 @@ Response Policy for {state_name}:
         
         sections.extend([
             "",
-            "Generate a brief (1-2 sentence) response appropriate for this state."
+            "Generate a brief (1-2 sentence) response appropriate for this affect."
         ])
         
         return "\n".join(sections)

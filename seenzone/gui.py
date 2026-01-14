@@ -262,29 +262,31 @@ def run_unified_demo(agent, webcam, max_cycles: int = 0):
     """
     Run the full agent with unified GUI visualization.
     
+    ARCHITECTURE:
+        - AffectProcessor is the SINGLE SOURCE OF TRUTH for emotion labels
+        - FSM (if used) is for policy only, not emotion detection
+        - GUI displays affect labels, NOT FSM state
+    
     Args:
         agent: SeenZoneAgent instance
         webcam: WebcamSensor instance
         max_cycles: Maximum cycles (0 = unlimited)
     """
     import time
-    from .debug_logger import (
-        log_timing, log_cues, log_state_change, log_response, 
-        log_skip, log_cycle_summary, Timer
-    )
+    from .debug_logger import log_timing, log_response, log_skip, Timer
     
     gui = SeenZoneGUI()
     
     print("\n[Demo] Starting unified visualization")
-    print("[Demo] Press 'q' to quit")
-    print("[Demo] Debug logging ENABLED\n")
+    print("[Demo] Using CONTINUOUS AFFECT model (not rules)")
+    print("[Demo] Press 'q' to quit\n")
     
     cycle = 0
     
     # Response rate limiting
     RESPONSE_COOLDOWN = 5.0  # seconds
     last_response_time = 0
-    last_state = None
+    last_affect_label = None
     last_response = "I'm here with you."
     
     # FPS tracking
@@ -303,69 +305,75 @@ def run_unified_demo(agent, webcam, max_cycles: int = 0):
                 print("[Demo] Failed to read frame")
                 break
             
-            # ========== CV PROCESSING ==========
-            cues = []
-            raw_cues = None
-            if agent.cv_processor and agent.cue_interpreter:
-                with Timer("CV", auto_log=True) as cv_timer:
+            # ========== CV + AFFECT PROCESSING ==========
+            affect_label = "Uncertain"
+            affect_confidence = 0.0
+            affect_data = {}
+            
+            if agent.cv_processor and agent.affect_processor:
+                with Timer("CV", auto_log=(cycle % 30 == 0)):
                     raw_cues = agent.cv_processor.process(frame)
-                    predicates = agent.cue_interpreter.interpret(raw_cues)
-                    cues = predicates.to_fol_predicates()
                 
-                log_cues(cues)
+                # AffectProcessor is the SINGLE SOURCE of emotion labels
+                with Timer("Affect", auto_log=(cycle % 30 == 0)):
+                    affect_state = agent.affect_processor.process(raw_cues)
+                    affect_label = str(affect_state.label)
+                    affect_confidence = affect_state.confidence
+                    affect_data = affect_state.to_dict()
                 
-                # Draw face mesh on frame USING CACHED raw_cues (no re-processing!)
-                # Pass raw_cues to avoid calling process() again inside draw_landmarks
+                # Draw face mesh on frame
                 frame = agent.cv_processor.draw_landmarks(frame, raw_cues)
             
-            # ========== INFERENCE ==========
-            rule_fired = None
-            new_state = None
-            if agent.inference_engine and cues:
-                with Timer("Inference", auto_log=True):
-                    agent.inference_engine.update_facts(cues)
-                    new_state = agent.inference_engine.infer()
-                
-                # Get fired rule name
-                if agent.inference_engine._last_result and agent.inference_engine._last_result.fired_rule:
-                    rule = agent.inference_engine._last_result.fired_rule
-                    rule_fired = f"{rule.name} (priority={rule.priority})"
-                
-                # Execute state transition
-                if new_state:
-                    old_state = agent.state_space.current_state
-                    agent.state_space.transition_to(new_state)
-                    log_state_change(old_state, new_state, rule_fired)
-            
-            # Get current state
-            current_state = agent.state_space.current_state
-            
-            # ========== RESPONSE GENERATION (with cooldown) ==========
+            # ========== RESPONSE GENERATION (based on affect, not FSM) ==========
             now = time.time()
-            state_changed = current_state != last_state
+            affect_changed = affect_label != last_affect_label
             cooldown_expired = (now - last_response_time) > RESPONSE_COOLDOWN
             
-            if agent.llm_responder and (state_changed or cooldown_expired):
+            if agent.llm_responder and (affect_changed or cooldown_expired):
+                # Map affect label to EmotionalState for LLM responder compatibility
+                state_name = agent.affect_processor.get_emotional_state_name() if agent.affect_processor else "S0_NEUTRAL"
+                try:
+                    from .state_space import EmotionalState
+                    compat_state = EmotionalState[state_name]
+                except:
+                    compat_state = EmotionalState.S0_NEUTRAL
+                
                 with Timer("LLM", auto_log=True):
-                    response = agent.llm_responder.generate_response(current_state, cues)
+                    response = agent.llm_responder.generate_response(
+                        compat_state, 
+                        [f"AffectLabel({affect_label})"]
+                    )
                 last_response = response
                 last_response_time = now
-                last_state = current_state
+                last_affect_label = affect_label
                 source = "LLM" if agent.llm_responder.is_llm_available() else "fallback"
                 log_response(response, source)
             else:
                 response = last_response
-                if cycle % 30 == 0:  # Log skip every 30 frames to reduce noise
+                if cycle % 60 == 0:
                     log_skip("Response cached (cooldown active)")
             
-            # ========== RENDER GUI ==========
-            rendered = gui.render(
-                frame=frame,
-                state=current_state,
-                cues=[c.split("(")[0] for c in cues],  # Clean cue names
-                rule_fired=rule_fired,
-                response=response,
-                cycle=cycle
+            # ========== RENDER GUI (with AFFECT label, not FSM state) ==========
+            # Create affect display state (duck-typing for GUI compatibility)
+            class AffectDisplayState:
+                def __init__(self, label, confidence):
+                    self.name = f"{label} ({confidence:.0%})"
+            
+            affect_display = AffectDisplayState(affect_label, affect_confidence)
+            
+            # Map affect labels to colors
+            AFFECT_COLORS = {
+                "Positive": (100, 255, 100),      # Green
+                "Sad": (255, 150, 100),           # Blue-ish
+                "Stressed": (100, 100, 255),      # Red
+                "Distressed": (200, 150, 255),    # Purple
+                "Uncertain": (200, 200, 200),     # Gray
+            }
+            
+            # Temporarily override STATE_COLORS lookup
+            rendered = _render_with_affect(
+                gui, frame, affect_label, affect_confidence,
+                affect_data, response, cycle, AFFECT_COLORS
             )
             
             # ========== FPS CALCULATION ==========
@@ -375,12 +383,9 @@ def run_unified_demo(agent, webcam, max_cycles: int = 0):
                 current_fps = fps_frame_count / fps_elapsed
                 fps_frame_count = 0
                 fps_start = time.perf_counter()
-                log_cycle_summary(cycle, current_fps, current_state, len(cues))
-            
-            # ========== CYCLE TIMING ==========
-            cycle_time = (time.perf_counter() - cycle_start) * 1000
-            if cycle % 30 == 0:  # Log every 30 cycles to reduce noise
-                log_timing("Cycle", cycle_time, f"(~{1000/cycle_time:.1f} FPS)")
+                # Log affect summary instead of FSM state
+                print(f"[AFFECT_SUMMARY] cycle={cycle} fps={current_fps:.1f} "
+                      f"label={affect_label} conf={affect_confidence:.2f}")
             
             # Show and check for quit
             if not gui.show(rendered):
@@ -396,3 +401,93 @@ def run_unified_demo(agent, webcam, max_cycles: int = 0):
     finally:
         gui.close()
         print(f"[Demo] Completed {cycle} cycles")
+
+
+def _render_with_affect(gui, frame, affect_label, affect_confidence, 
+                        affect_data, response, cycle, affect_colors):
+    """
+    Render GUI with affect labels instead of FSM state.
+    
+    This is a custom render function that displays:
+    - AFFECT: Positive (63%) instead of STATE: S0_NEUTRAL
+    - Valence/Arousal/Engagement values
+    - No FSM state, no rules, no predicates
+    """
+    import cv2
+    import numpy as np
+    
+    cfg = gui.config
+    
+    # Create output canvas
+    canvas = np.zeros((cfg.height, cfg.width, 3), dtype=np.uint8)
+    canvas[:] = cfg.bg_color
+    
+    # Layout: video on top, info panel below
+    video_height = int(cfg.height * 0.6)
+    
+    # Resize and place video frame
+    if frame is not None:
+        frame_resized = cv2.resize(frame, (cfg.width, video_height))
+        canvas[0:video_height, 0:cfg.width] = frame_resized
+    
+    # Draw divider line
+    cv2.line(canvas, (0, video_height), (cfg.width, video_height), 
+             cfg.divider_color, 2)
+    
+    # Draw title bar
+    overlay = canvas.copy()
+    cv2.rectangle(overlay, (0, 0), (cfg.width, 35), (0, 0, 0), -1)
+    cv2.addWeighted(overlay, 0.7, canvas, 0.3, 0, canvas)
+    cv2.putText(canvas, "SeenZone - Continuous Affect Model", (10, 25),
+                cfg.font, cfg.normal_font_scale, cfg.text_color, 1)
+    
+    # ========== INFO PANEL ==========
+    y = video_height + 30
+    left_margin = 15
+    
+    # Panel background
+    panel_bg = tuple(min(255, c + 20) for c in cfg.bg_color)
+    cv2.rectangle(canvas, (0, video_height), (cfg.width, cfg.height), panel_bg, -1)
+    
+    # === AFFECT LABEL (Primary Display) ===
+    affect_color = affect_colors.get(affect_label, (200, 200, 200))
+    affect_text = f"AFFECT: {affect_label} ({affect_confidence:.0%})"
+    cv2.putText(canvas, affect_text, (left_margin, y),
+                cfg.font, cfg.state_font_scale, affect_color, cfg.font_thickness)
+    y += 35
+    
+    # === CONTINUOUS VALUES ===
+    valence = affect_data.get('valence', 0)
+    arousal = affect_data.get('arousal', 0)
+    engagement = affect_data.get('engagement', 0)
+    
+    values_text = f"V={valence:+.2f}  A={arousal:.2f}  E={engagement:.2f}"
+    cv2.putText(canvas, values_text, (left_margin, y),
+                cfg.font, cfg.normal_font_scale, cfg.cue_color, 1)
+    y += 25
+    
+    # === CYCLE COUNTER (top right of panel) ===
+    cycle_text = f"Cycle: {cycle}"
+    (text_w, _), _ = cv2.getTextSize(cycle_text, cfg.font, cfg.small_font_scale, 1)
+    cv2.putText(canvas, cycle_text, (cfg.width - text_w - 15, video_height + 25),
+                cfg.font, cfg.small_font_scale, cfg.cue_color, 1)
+    
+    # === DIVIDER ===
+    cv2.line(canvas, (left_margin, y), (cfg.width - left_margin, y), 
+             cfg.divider_color, 1)
+    y += 20
+    
+    # === RESPONSE ===
+    cv2.putText(canvas, "Response:", (left_margin, y),
+                cfg.font, cfg.small_font_scale, cfg.response_color, 1)
+    y += 22
+    
+    # Wrap response text
+    wrapped = gui._wrap_text(response, cfg.width - 30, cfg.font, cfg.normal_font_scale)
+    for line in wrapped[:2]:
+        cv2.putText(canvas, line, (left_margin, y),
+                    cfg.font, cfg.normal_font_scale, cfg.text_color, 1)
+        y += 22
+    
+    return canvas
+
