@@ -95,8 +95,8 @@ class AffectProcessor:
     # CONFIGURATION
     # =========================================================================
     
-    # EMA smoothing factor (0.05-0.2, lower = more smoothing)
-    SMOOTHING_ALPHA = 0.12
+    # EMA smoothing factor (higher = faster response, lower = more smoothing)
+    SMOOTHING_ALPHA = 0.25  # MVP: Faster response for demo
     
     # Weights for valence computation
     VALENCE_WEIGHTS = {
@@ -123,7 +123,7 @@ class AffectProcessor:
     # Region thresholds for emotion mapping
     REGIONS = {
         'positive': {'valence_min': 0.4, 'arousal_min': 0.3},
-        'sad': {'valence_max': -0.3, 'arousal_max': 0.3},
+        'sad': {'valence_max': -0.15, 'arousal_max': 0.4},  # Lowered threshold for easier sadness detection
         'stressed': {'valence_max': 0.0, 'arousal_min': 0.7},
         'distressed': {'valence_max': -0.2, 'engagement_max': 0.3},
     }
@@ -179,7 +179,8 @@ class AffectProcessor:
         
         if should_log:
             print(f"[AFFECT_RAW] valence={raw_valence:+.2f} "
-                  f"arousal={raw_arousal:.2f} engagement={raw_engagement:.2f}")
+                  f"arousal={raw_arousal:.2f} engagement={raw_engagement:.2f} "
+                  f"(head_pitch={cues.head_pitch:+.2f})")
         
         # Step 2: Apply EMA smoothing
         self._apply_smoothing(raw_valence, raw_arousal, raw_engagement, cues.face_detected)
@@ -219,19 +220,19 @@ class AffectProcessor:
         if not cues.face_detected:
             return 0.0, 0.0, 0.0
         
-        # ----- VALENCE -----
-        # Positive indicators
-        smile_contrib = cues.smile_ratio * self.VALENCE_WEIGHTS['smile_ratio']
-        cheek_contrib = cues.cheek_raise * self.VALENCE_WEIGHTS['cheek_raise']
-        express_contrib = (1.0 if cues.mouth_activity > 0.15 else 0.0) * self.VALENCE_WEIGHTS['expressive_face']
+        # ----- VALENCE (MVP SIMPLIFIED) -----
+        # Smile is the PRIMARY positive indicator - give it high weight
+        smile_contrib = cues.smile_ratio * 2.5  # STRONG positive from smile
+        cheek_contrib = cues.cheek_raise * 1.0  # Genuine smile boost
         
-        # Tension as negative (approximate from brow height)
-        tension = max(0, 0.5 - cues.brow_height) * 2  # Furrowed = high tension
-        tension_contrib = tension * self.VALENCE_WEIGHTS['tension']
+        # Head down as negative (but not too strong)
+        head_down = max(0, -cues.head_pitch * 2.0)  # Moderate sensitivity
+        head_down = min(1.0, head_down)
+        head_down_contrib = head_down * -1.0  # Moderate negative
         
-        raw_valence = smile_contrib + cheek_contrib + express_contrib + tension_contrib
-        # Normalize to [-1, +1]
-        raw_valence = max(-1.0, min(1.0, raw_valence - 0.5))
+        raw_valence = smile_contrib + cheek_contrib + head_down_contrib
+        # Normalize to [-1, +1], with small negative baseline
+        raw_valence = max(-1.0, min(1.0, raw_valence - 0.3))
         
         # ----- AROUSAL -----
         motion_contrib = cues.motion_energy * self.AROUSAL_WEIGHTS['motion_energy']
@@ -287,64 +288,38 @@ class AffectProcessor:
     
     def _update_label(self) -> None:
         """
-        Map continuous affect to discrete emotion region.
+        MVP SIMPLIFIED: Map affect to discrete emotion.
         
-        Uses closest-region selection, not priority-based.
-        Neutral/Uncertain is the default when no region is dominant.
+        Priority order (for reliable demo):
+        1. Smiling (valence > 0.1) → POSITIVE
+        2. Head down / negative valence → SAD  
+        3. Everything else → UNCERTAIN
         """
         v = self._smoothed.valence
-        a = self._smoothed.arousal
-        e = self._smoothed.engagement
         
-        # Calculate distance to each region
-        region_scores = {}
+        # =================================================================
+        # MVP RULE 1: POSITIVE VALENCE = HAPPY (highest priority)
+        # If valence is positive at all, user is happy. Smile overrides all.
+        # =================================================================
+        if v > 0.1:
+            self._smoothed.label = AffectLabel.POSITIVE
+            self._smoothed.confidence = min(1.0, 0.5 + v)
+            return
         
-        # Positive: valence > 0.4 AND arousal > 0.3
-        if v > 0.2:  # Only consider if vaguely positive
-            pos_v_score = max(0, (v - 0.4) / 0.6)  # How far above threshold
-            pos_a_score = max(0, (a - 0.3) / 0.7)
-            region_scores['positive'] = (pos_v_score + pos_a_score) / 2
+        # =================================================================
+        # MVP RULE 2: NEGATIVE VALENCE = SAD
+        # Head down or negative expression = sad
+        # =================================================================
+        if v < -0.1:
+            self._smoothed.label = AffectLabel.SAD
+            self._smoothed.confidence = min(1.0, 0.5 + abs(v))
+            return
         
-        # Sad: valence < -0.3 AND arousal < 0.3
-        if v < 0:  # Only consider if negative
-            sad_v_score = max(0, (-0.3 - v) / 0.7)
-            sad_a_score = max(0, (0.3 - a) / 0.3)
-            region_scores['sad'] = (sad_v_score + sad_a_score) / 2
-        
-        # Stressed: valence < 0 AND arousal > 0.7
-        if v < 0.1 and a > 0.5:
-            stress_v_score = max(0, (0.0 - v) / 1.0)
-            stress_a_score = max(0, (a - 0.7) / 0.3)
-            region_scores['stressed'] = (stress_v_score + stress_a_score) / 2
-        
-        # Distressed: valence < -0.2 AND engagement < 0.3
-        if v < 0 and e < 0.5:
-            dist_v_score = max(0, (-0.2 - v) / 0.8)
-            dist_e_score = max(0, (0.3 - e) / 0.3)
-            region_scores['distressed'] = (dist_v_score + dist_e_score) / 2
-        
-        # Find best matching region
-        if region_scores:
-            best_region = max(region_scores, key=region_scores.get)
-            best_score = region_scores[best_region]
-            
-            # Only assign label if score is meaningful (> 0.2)
-            if best_score > 0.2:
-                label_map = {
-                    'positive': AffectLabel.POSITIVE,
-                    'sad': AffectLabel.SAD,
-                    'stressed': AffectLabel.STRESSED,
-                    'distressed': AffectLabel.DISTRESSED,
-                }
-                self._smoothed.label = label_map[best_region]
-                # Confidence based on how well we match the region
-                self._smoothed.confidence = min(1.0, best_score + 0.3)
-                return
-        
-        # Default: Uncertain (no dominant region)
+        # =================================================================
+        # MVP RULE 3: EVERYTHING ELSE = UNCERTAIN (neutral)
+        # =================================================================
         self._smoothed.label = AffectLabel.UNCERTAIN
-        # Low confidence when uncertain
-        self._smoothed.confidence = max(0.1, 0.3 - abs(v) * 0.5)
+        self._smoothed.confidence = 0.4
     
     # =========================================================================
     # CONFIDENCE DECAY
